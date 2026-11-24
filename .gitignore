@@ -77,3 +77,30 @@ configs/paths/*.yaml
 !configs/paths/default.yaml
 evaluate_results/
 robotwin_results_500.tar.gz
+
+# Cluster-local Hugging Face caches (weights in checkpoints/ are ignored above).
+/hf-cache/
+/hf_cache/
+/.cache/huggingface/
+
+# Cluster environments and package/build caches, if placed inside this repo.
+# Anchor to the repo root; do not hide source directories named envs elsewhere.
+/envs/
+/envs-conda-test/
+/env_manage/
+/wheelhouse/
+
+# Cluster smoke/preflight artifacts and Slurm logs.
+/gpu-smoke.*/
+/wam-preflight.*/
+/eval_shards/
+/*.out
+/*.err
+
+# Generated evaluation-site variants; keep site.example.yaml tracked.
+/configs/robotwin/site.conda-test.yaml
+/configs/robotwin/site.conda-test.*.yaml
+/configs/robotwin/site.ready.*.yaml
+
+# RoboTwin and its downloaded assets/CuRobo are already excluded by
+# codegen/sim/.gitignore. Keep capsim/third_party/README.md tracked.
