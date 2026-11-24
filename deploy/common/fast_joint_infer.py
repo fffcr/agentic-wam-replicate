@@ -231,6 +231,10 @@ def install(model) -> None:
             # the first step supplies them; the mask is step-invariant after that.
             attn_mask = None
 
+            # Optional benchmark callback; events do not synchronise the loop.
+            _stage_timer = getattr(self, "_bench_stage_timer", None)
+            if _stage_timer is not None:
+                _stage_timer("denoising", True)
             for step_index, (t_a, d_a) in enumerate(zip(ts_a, deltas_a)):
                 sigma_v = self.video_scheduler.sigmas[step_index].to(device=device, dtype=cdt)
                 ts_v = self.video_scheduler.timesteps[step_index]
@@ -281,6 +285,8 @@ def install(model) -> None:
                         order = torch.argsort(conf, descending=True)[:k]
                         code_ids[0, masked[order]] = tok[order].to(code_ids.dtype)
 
+            if _stage_timer is not None:
+                _stage_timer("denoising", False)
             action_out = latents_action[0].detach().float().cpu()
             # the finished gen_len canvas, exactly re-usable as _pinned_code_ids
             self._last_code_canvas = code_ids[0, plen:].detach().clone()

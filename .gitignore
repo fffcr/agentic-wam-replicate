@@ -75,3 +75,5 @@ configs/robotwin/site.yaml
 # Per-machine paths files (configs/paths/<machine>.yaml); only the template is tracked
 configs/paths/*.yaml
 !configs/paths/default.yaml
+evaluate_results/
+robotwin_results_500.tar.gz

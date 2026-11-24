@@ -1200,6 +1200,10 @@ class AgenticWAMCosmos(nn.Module):
                 code_aux_null = {"t_mod": code_pre_null["t_mod"], "freqs": code_pre_null["freqs"], "context": None}
             if _cfg_wc > 0 or _cfg_wv > 0:
                 logger.info("CFG-infer active: wc=%.2f wv=%.2f", _cfg_wc, _cfg_wv)
+            # Optional benchmark callback; events do not synchronise the loop.
+            _stage_timer = getattr(self, "_bench_stage_timer", None)
+            if _stage_timer is not None:
+                _stage_timer("denoising", True)
             for step_index, (t_a, d_a) in enumerate(zip(ts_a, deltas_a)):
                 sigma_v = self.video_scheduler.sigmas[step_index].to(device=device, dtype=cdt)
                 ts_v = self.video_scheduler.timesteps[step_index]
@@ -1378,6 +1382,8 @@ class AgenticWAMCosmos(nn.Module):
                             else:
                                 tok = logits[masked].argmax(-1)
                                 code_ids[0, masked[:k]] = tok[:k].to(code_ids.dtype)
+            if _stage_timer is not None:
+                _stage_timer("denoising", False)
             if _viz_on:
                 _VIZ["steps"].append([int(x) for x in code_ids[0].tolist()])   # final state
                 import json as _json

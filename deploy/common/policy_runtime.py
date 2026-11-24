@@ -43,7 +43,8 @@ class PolicyRuntime:
                  dataset_stats: Optional[str] = None,
                  action_horizon: Optional[int] = None, replan_steps: int = 24,
                  num_inference_steps: int = 10, device: str = "cuda",
-                 video_log_dir: Optional[str] = None, text_max_len: int = 128):
+                 video_log_dir: Optional[str] = None, text_max_len: int = 128,
+                 config_name: str = "train"):
         sys.path.insert(0, AGENTICWAM + "/src")
         sys.path.insert(0, AGENTICWAM + "/robotwin/deploy")
         os.environ.setdefault("DIFFSYNTH_DOWNLOAD_SOURCE", "huggingface")
@@ -59,7 +60,7 @@ class PolicyRuntime:
         if GlobalHydra.instance().is_initialized():
             GlobalHydra.instance().clear()
         with initialize_config_dir(version_base="1.3", config_dir=os.path.join(AGENTICWAM, "configs")):
-            cfg = compose(config_name="train", overrides=[f"task={task}"] + ([f"data.dataset_root={dataset}"] if dataset else [])
+            cfg = compose(config_name=config_name, overrides=[f"task={task}"] + ([f"data.dataset_root={dataset}"] if dataset else [])
                           + list(overrides or []))
         OmegaConf.set_struct(cfg, False)
         self.cfg = cfg
