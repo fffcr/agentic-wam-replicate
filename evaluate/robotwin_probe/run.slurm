@@ -31,5 +31,6 @@ nvidia-smi
 srun "$runtime/bin/python" -u evaluate/robotwin_probe/runner.py \
   --output "$out" --task "${PROBE_TASK:-click_alarmclock}" \
   --protocols "${PROBE_PROTOCOLS:-clean}" \
-  --modes "${PROBE_MODES:-eager,compile}" \
+  --modes "${PROBE_MODES:-eager}" \
+  --max-replans "${PROBE_MAX_REPLANS:-8}" \
   --warmup "${PROBE_WARMUP:-2}" --reps "${PROBE_REPS:-5}" --trace

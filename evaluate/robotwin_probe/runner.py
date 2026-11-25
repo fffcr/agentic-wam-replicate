@@ -152,8 +152,12 @@ def worker(a):
         report['internal_attribution'] = ('available in separate eager diagnostic call' if a.mode == 'eager'
                                           else 'compiled internal experts are opaque; not reported as zero')
         print('DIAGNOSTIC expert ms:', report['expert_ms'], flush=True)
+        report['diffusion_expert_ms'] = timer.diffusion_expert_ms if a.mode == 'eager' else None
+        print('DIFFUSION expert ms:', report['diffusion_expert_ms'], flush=True)
         print('ACTION post_attn nested ms:', report['action_nested_ms'], flush=True)
         print('DENOISING total ms:', totals.get('denoising'), flush=True)
+        for name, ms in sorted(totals.items()):
+            print(f'SECTION_MS {name}={ms:.3f} (inclusive CUDA event span)', flush=True)
 
     if a.trace and a.mode == 'eager':
         from expert_trace import TraceRanges
@@ -184,7 +188,7 @@ def main():
     p.add_argument('--capture-dir', type=Path)
     p.add_argument('--task', default='click_alarmclock')
     p.add_argument('--protocols', default='clean', choices=['clean', 'randomized', 'clean,randomized'])
-    p.add_argument('--modes', default='eager,compile', help='eager,compile; optionally add multistream')
+    p.add_argument('--modes', default='eager', help='eager; optionally add compile or multistream')
     p.add_argument('--warmup', type=int, default=2)
     p.add_argument('--reps', type=int, default=5)
     p.add_argument('--max-replans', type=int, default=8)
@@ -255,8 +259,12 @@ def main():
                 result = subprocess.run(cmd, cwd=ROOT, env=env, stdout=stdout, stderr=stderr)
             status['phases'][mode] = 'ok' if result.returncode == 0 else 'failed'
             if result.returncode == 0 and mode != 'multistream':
-                subprocess.run([sys.executable, str(ROOT / 'evaluate/analyze_expert_bench.py'),
+                subprocess.run([sys.executable, str(ROOT / 'evaluation/analyze_expert_bench.py'),
                                 str(a.output / mode)], check=True)
+                analysis = json.loads((a.output / mode / 'analysis.json').read_text())
+                status.setdefault('analysis', {})[mode] = dict(
+                    status=analysis['analysis_status'], trace_status=analysis['trace_status'],
+                    trace_error=analysis.get('trace_error'))
         reports = {m: json.loads((a.output / m / 'report.json').read_text()) for m in modes
                    if status['phases'].get(m) == 'ok'}
         if 'eager' in reports:

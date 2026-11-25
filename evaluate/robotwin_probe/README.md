@@ -8,8 +8,8 @@ The optional compile/stream experiments apply to that benchmark process only.
 ## One command on the cluster
 
 Sync this directory and the existing helpers `evaluate/expert_trace.py`,
-`evaluate/analyze_expert_bench.py`, `evaluate/analyze_replan_overlap.py` and
-`deploy/common/replan_record.py` to the server. Optional multistream also needs
+`evaluation/analyze_expert_bench.py` and `evaluate/analyze_replan_overlap.py`
+to the server. The recorder is self-contained in this directory. Optional multistream also needs
 `evaluate/expert_streams.py`. No archive download/extraction is required. The joint
 model/simulator environment, RoboTwin assets and site.yaml must already be configured.
 
@@ -24,6 +24,8 @@ sbatch --output="$PWD/runs/robotwin_probe/%j.out" \
 Default: one real `click_alarmclock` clean episode via the author's `--plan smoke`,
 BF16/20 denoising steps/24-action replan settings from author config. Set
 `PROBE_PROTOCOLS=clean,randomized` to run the author's full two-setting smoke.
+Default replay is eager only. Set `PROBE_MODES=eager,compile` explicitly for the
+later compilation experiment; initial action-format and section tests need no compilation.
 Rendering still requires a functioning NVIDIA Vulkan stack, even without saved videos.
 If smoke fails, the probe stops; no synthetic observations are substituted.
 
@@ -44,6 +46,10 @@ author implementation to repair a missing model cache.
 1. Captures at most eight real replans per episode, with camera images, raw state,
    full qpos chunk, code, actual completed action-command tick, and pre-inference
    RNG/history context. These are qpos command ticks, not physics substeps.
+   `PROBE_MAX_REPLANS` controls this limit in the Slurm script. Each captured
+   replan also records action head velocity, scheduler input/output and normalized
+   final action, using temporary runtime wrappers. GPU tensors are cloned during
+   inference and exported afterwards. These captures are never timing samples.
 2. Compares old chunk[R:] and new chunk[:overlap] at matching command ticks.
    Episode boundaries are not mixed. No claim is made about hidden-state cache reuse.
 3. Selects the second captured observation if available, reconstructs the original
@@ -81,8 +87,31 @@ Everything is under `runs/robotwin_probe/JOB/`:
 - `summary.json`: phase status, clean speed comparison, parity and author source hashes.
 - `capture/shard_*/`: real observation/action NPZ, RNG/history context,
   `overlap_report.json` and aligned `overlap_rows.csv`.
+- `capture/shard_*/replan_*.actions.csv`: every original denormalized qpos target
+  and the next target minus the current target per dimension. These differences
+  are target differences, not measured robot displacement or velocity.
+- `capture/shard_*/executed_actions.csv`: actual targets passed to completed
+  `take_action` calls for captured replans, keyed by episode, tick and replan.
+- `capture/shard_*/replan_*.diffusion.npz`: `expert_prediction`,
+  `scheduler_prediction`, `latent_before`, `latent_after` have shape [N,B,T,D];
+  `delta` has a per-call axis and `normalized_final` has a single call axis.
+  Values are stored as float32; original tensor dtypes and measured shapes are in
+  `replan_*.schema.json`. The action expert predicts flow-matching velocity in
+  normalized space, NOT executable qpos. Scheduler updates are
+  `latent_after = latent_before + scheduler_prediction * delta`.
+- `eager/sections.csv`: inclusive CUDA-event and CPU wall spans per stage.
+  CPU wall times do not synchronise each stage and are not standalone GPU times.
+- `eager/per_step_experts.csv`: video/code/action and shared-attention CUDA spans
+  per diffusion step. Code heads are assigned by observed iteration, even when
+  some iterations skip the head. Shared joint attention is counted once.
 - `{eager,compile}/report.json`: clean latency, actual parameter dtypes/counts,
   action checks, diagnostic totals, compiler counters.
+  `expert_ms` covers wrapped expert calls across the entire inference;
+  `diffusion_expert_ms` covers only calls made during denoising. These include
+  pre/post, heads and schedulers, but exclude shared attention from each expert.
+  They do not partition the full diffusion duration: mask construction, token
+  selection and unwrapped operations also take time. Nested action FFN/cross
+  attention are already included in action.post_attn and must not be added again.
 - `eager/detail_calls.csv`: per-call, per-layer expert timings and nested action parts.
 - `eager/per_step_parts.csv`: per-denoising-step parts, INCLUDING nested columns;
   parent and child are not additive.
@@ -93,10 +122,30 @@ Everything is under `runs/robotwin_probe/JOB/`:
   approximate iteration boundaries. Full denoising total and expert call indices
   do not depend on this approximation.
 - `eager/trace.json`, `eager/analysis.json`, `eager/operators.txt` for deeper diagnosis.
+  The analyzer selects the CPU BENCH_ROUND annotation, excluding same-name GPU
+  annotations. A missing/ambiguous trace marker is recorded as trace_status=failed
+  and analysis_status=partial; existing action captures and CUDA-event results
+  remain available. Reanalyze old runs on a login node without rerunning inference:
+  `python evaluation/analyze_expert_bench.py runs/robotwin_probe/JOBID/eager`.
 - `{eager,compile}.err`: errors; successful exit alone is not task success.
 
 An episode with fewer than two replans cannot establish overlap; its report has
 no pairs. Choose a longer task to gather additional real replans if necessary.
+
+Print action shapes, adjacent command targets, diffusion head output and aligned
+consecutive replans after the job (substitute the actual job ID):
+
+```bash
+python evaluate/robotwin_probe/inspect_actions.py runs/robotwin_probe/JOBID
+cat runs/robotwin_probe/JOBID/eager/per_step_experts.csv
+cat runs/robotwin_probe/JOBID/eager/sections.csv
+cat runs/robotwin_probe/JOBID/eager.out
+```
+
+Observations are saved at replans; this is not a camera-frame capture at every
+executed action. Consecutive action rows, consecutive replan observations and
+consecutive diffusion iterations are three different axes. Compare old[24:32]
+with new[:8] only when the actual advance is 24 and the measured horizon is 32.
 
 To reuse captured observations after a compiler failure, without rerunning rendering:
 

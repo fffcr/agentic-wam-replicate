@@ -1,6 +1,7 @@
 """CUDA-event wrappers, installed only during a separate diagnostic call."""
 from collections import defaultdict
 import csv
+import time
 
 
 class Timer:
@@ -10,6 +11,12 @@ class Timer:
         self.pending = {}
         self.restores = []
         self.step_starts = []
+        self.wall_ms = defaultdict(list)
+        self.current_step = None
+        self.pending_steps = {}
+        self.event_steps = defaultdict(list)
+        self.diffusion_expert_ms = {}
+        self.internal_experts_available = True
 
     def event(self):
         e = self.torch.cuda.Event(enable_timing=True)
@@ -18,9 +25,15 @@ class Timer:
 
     def mark(self, name, start):
         if start:
+            if name == 'denoising':
+                self.current_step = None
             self.pending[name] = self.event()
+            self.pending_steps[name] = self.current_step
         else:
             self.events[name].append((self.pending.pop(name), self.event()))
+            self.event_steps[name].append(self.pending_steps.pop(name))
+            if name == 'denoising':
+                self.current_step = None
 
     def wrap(self, obj, attr, name, step_boundary=False):
         original = getattr(obj, attr)
@@ -28,11 +41,14 @@ class Timer:
 
         def timed(*args, **kwargs):
             if step_boundary:
+                self.current_step = len(self.step_starts)
                 self.step_starts.append(self.event())
             self.mark(name, True)
+            wall_start = time.perf_counter()
             try:
                 return original(*args, **kwargs)
             finally:
+                self.wall_ms[name].append((time.perf_counter()-wall_start)*1000)
                 self.mark(name, False)
 
         setattr(obj, attr, timed)
@@ -58,9 +74,20 @@ class Timer:
             for i, (s, e) in enumerate(pairs):
                 step, layer = ((i // layers, i % layers) if layer_stage else
                                ((i, '') if len(pairs) == nis else ('', '')))
+                # Code heads may be skipped or called repeatedly: attribute by the
+                # observed video_pre iteration, never infer their step from call count.
+                if len(self.event_steps.get(name, [])) == len(pairs):
+                    observed = self.event_steps[name][i]
+                    step = observed if observed is not None else ''
                 rows.append([name, i, step, layer, s.elapsed_time(e)])
         write_csv(directory / 'detail_calls.csv',
                   ['stage', 'call', 'step', 'layer', 'ms'], rows)
+        write_csv(directory / 'sections.csv',
+                  ['stage', 'calls', 'cuda_event_total_ms', 'cpu_wall_total_ms', 'scope'],
+                  [[name, len(pairs), totals[name],
+                    sum(self.wall_ms[name]) if name in self.wall_ms else '',
+                    'inclusive; nested stages are not additive; CPU wall may be asynchronous']
+                   for name, pairs in self.events.items()])
         if len(self.step_starts) != nis or len(self.events.get('denoising', [])) != 1:
             raise RuntimeError('Expected one joint denoising loop with nis video_pre calls')
         start, end = self.events['denoising'][0]
@@ -74,6 +101,16 @@ class Timer:
             per_step.append([step, *[sum(r[4] for r in rows if r[0] == stage and r[2] == step)
                                      for stage in stages]])
         write_csv(directory / 'per_step_parts.csv', ['step', *stages], per_step)
+        # Each expert's pre/post blocks plus head/embedding and scheduler; no nested components.
+        # The joint attention is one shared operation and must not be assigned to all experts.
+        names = ('video', 'code', 'action', 'shared')
+        if self.internal_experts_available:
+            self.diffusion_expert_ms = {
+                n: sum(r[4] for r in rows if r[2] != '' and r[0].startswith(n+'.'))
+                for n in names}
+            write_csv(directory / 'per_step_experts.csv', ['step', *[n+'_ms' for n in names]],
+                      [[step, *[sum(r[4] for r in rows if r[2] == step and r[0].startswith(n+'.'))
+                                 for n in names]] for step in range(nis)])
         return totals
 
 
@@ -85,11 +122,16 @@ def write_csv(path, header, rows):
 
 
 def install(timer, policy, eager):
+    timer.internal_experts_available = eager
     model = policy.model
+    timer.wrap(policy, '_infer_action_chunk', 'policy.total')
     timer.wrap(policy, '_build_obs_video', 'obs.preprocess')
+    timer.wrap(policy, '_normalize_state', 'obs.state_normalize')
+    timer.wrap(policy, '_denormalize_action', 'output.denormalize')
     timer.wrap(policy.text, 'encode', 'obs.text_encode_warm')
     timer.wrap(model, '_encode_video_latents', 'obs.vae')
     timer.wrap(model, '_vit_prefix', 'obs.qwen')
+    timer.wrap(model.mot, 'forward', 'mot.total')
     timer.wrap(model, '_video_pre', 'video.pre_dit', step_boundary=True)
     timer.wrap(model, '_video_post', 'video.post_dit')
     timer.wrap(model.video_scheduler, 'step', 'video.scheduler')

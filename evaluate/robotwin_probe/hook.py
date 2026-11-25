@@ -1,5 +1,6 @@
 """External, process-local capture wrappers. Never writes any author source file."""
 import copy
+import csv
 import importlib.abc
 import importlib.machinery
 import json
@@ -44,8 +45,7 @@ def save_context(saved, path):
 
 class Capture:
     def __init__(self, policy, usr_args):
-        sys.path.insert(0, str(ROOT / 'deploy'))
-        from common.replan_record import ReplanRecorder
+        from recording import ReplanRecorder
         if policy.hybrid is not None:
             raise ValueError('Capture supports pure WAM, not hybrid skill execution')
         if policy.model.action_expert.action_dim != 14:
@@ -70,12 +70,14 @@ class Capture:
         if self.episode != self.policy.episode_count:
             self.episode = self.policy.episode_count
             self.tick = self.episode_records = 0
+            self.active_replan = None
 
     def before(self):
         self.sync_episode()
+        self.active_replan = None
         return snapshot(self.policy) if self.episode_records < self.limit else None
 
-    def after(self, observation, instruction, chunk, saved):
+    def after(self, observation, instruction, chunk, saved, outputs=None):
         if saved is None:
             return
         index = self.recorder.count
@@ -86,7 +88,24 @@ class Capture:
             instruction=instruction, episode_id=self.episode, start_step=self.tick,
             code=self.policy._last_code)
         save_context(saved, self.directory / f'replan_{index:06d}.context.pt')
+        if outputs is not None:
+            outputs.export(self.directory / f'replan_{index:06d}', chunk)
+        self.active_replan = index
         self.episode_records += 1
+
+    def executed(self, target):
+        """Targets passed to completed take_action calls, including chunk association."""
+        import numpy as np
+        if getattr(self, 'active_replan', None) is None:
+            return
+        path = self.directory / 'executed_actions.csv'
+        exists = path.exists()
+        with path.open('a', newline='') as f:
+            w = csv.writer(f)
+            if not exists:
+                w.writerow(['episode', 'action_tick', 'replan', 'dim', 'target'])
+            for d, value in enumerate(np.asarray(target).reshape(-1)):
+                w.writerow([self.episode, self.tick, self.active_replan, d, float(value)])
 
 
 def attach(policy, capture):
@@ -94,8 +113,16 @@ def attach(policy, capture):
 
     def infer(observation, instruction):
         saved = capture.before()
-        chunk = original_infer(observation, instruction)
-        capture.after(observation, instruction, chunk, saved)
+        outputs = None
+        if saved is not None:
+            from outputs import ActionOutputs
+            outputs = ActionOutputs(policy).install()
+        try:
+            chunk = original_infer(observation, instruction)
+        finally:
+            if outputs is not None:
+                outputs.restore()
+        capture.after(observation, instruction, chunk, saved, outputs)
         return chunk
 
     def step(task_env, observation):
@@ -104,7 +131,10 @@ def attach(policy, capture):
         had_local, local = 'take_action' in vars(task_env), vars(task_env).get('take_action')
 
         def take_action(*args, **kwargs):
+            target = copy.deepcopy(args[0] if args else kwargs.get('action'))
             result = original(*args, **kwargs)
+            if hasattr(capture, 'executed'):
+                capture.executed(target)
             capture.tick += 1
             return result
 
