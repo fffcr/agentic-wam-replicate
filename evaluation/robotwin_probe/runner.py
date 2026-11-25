@@ -43,10 +43,37 @@ def compile_check(mode, unique_graphs, measured_new_graphs):
                 valid_steady_measurement=unique_graphs > 0 and measured_new_graphs == 0)
 
 
+def compile_environment(env):
+    """PyTorch 2.7 treats even TORCH_COMPILE_DISABLE='0' as truthy. Unset it."""
+    result = dict(env)
+    for name in ('TORCH_COMPILE_DISABLE', 'TORCHDYNAMO_DISABLE', 'TORCHDYNAMO_SUPPRESS_ERRORS',
+                 'RW_PROBE_CAPTURE'):
+        result.pop(name, None)
+    result.update(AGENTICWAM_FAST_JOINT='0', AGENTICWAM_TORCH_COMPILE='')
+    return result
+
+
 def worker(a):
+    # Do this before importing torch; Dynamo config may snapshot the environment at import.
+    for name in ('TORCH_COMPILE_DISABLE', 'TORCHDYNAMO_DISABLE', 'TORCHDYNAMO_SUPPRESS_ERRORS',
+                 'RW_PROBE_CAPTURE'):
+        os.environ.pop(name, None)
     import numpy as np
     import torch
+    import torch._dynamo
+    from torch._dynamo.utils import counters
     from hook import restore
+
+    a.output.mkdir(parents=True, exist_ok=False)
+    compiler_state = dict(torch=torch.__version__,
+                         TORCH_COMPILE_DISABLE=os.environ.get('TORCH_COMPILE_DISABLE'),
+                         TORCHDYNAMO_DISABLE=os.environ.get('TORCHDYNAMO_DISABLE'),
+                         dynamo_config_disable=repr(torch._dynamo.config.disable),
+                         dynamo_suppress_errors=bool(torch._dynamo.config.suppress_errors))
+    (a.output/'compiler_environment.json').write_text(json.dumps(compiler_state, indent=2))
+    print('COMPILER_ENVIRONMENT:', json.dumps(compiler_state), flush=True)
+    if torch._dynamo.config.disable or torch._dynamo.config.suppress_errors:
+        raise RuntimeError('Dynamo remains disabled or suppresses errors; inspect compiler_environment.json')
 
     directory = a.record.parent
     info = json.loads((directory / 'run_info.json').read_text())
@@ -83,7 +110,6 @@ def worker(a):
         return np.asarray(policy._infer_action_chunk(obs, meta['instruction']))
 
     reference = captured_action
-    from torch._dynamo.utils import counters
     counters.clear()
     print(f'COMPILE_SETUP scope=MoT.forward mode={a.compile_mode} fullgraph=True', flush=True)
     original_mot.forward = torch.compile(original_mot.forward, mode=a.compile_mode, fullgraph=True)
@@ -98,6 +124,14 @@ def worker(a):
     parity = action_diff(reference, actual)
     capture_match = parity
     same_code = policy._last_code == meta.get('code')
+    first_graphs = counters.get('stats', {}).get('unique_graphs', 0)
+    (a.output/'first_call.json').write_text(json.dumps(dict(
+        first_mode_call_ms=first_call_ms, unique_graphs=first_graphs,
+        capture_match=parity, same_code=same_code), indent=2))
+    print(f'COMPILE_VERIFIED unique_graphs={first_graphs}', flush=True)
+    if first_graphs < 1:
+        raise RuntimeError('First model call produced no Dynamo graph; stopping before warmup/samples. '
+                           'Inspect compiler_environment.json and first_call.json')
 
     warmup_start = time.perf_counter()
     for index in range(a.warmup):
@@ -118,7 +152,6 @@ def worker(a):
         samples.append((time.perf_counter()-start)*1000)
         actions.append(x.copy())
         print(f'SAMPLE {index+1}/{a.reps} mode={a.mode} elapsed_ms={samples[-1]:.3f}', flush=True)
-    a.output.mkdir(parents=True, exist_ok=False)
     np.savez_compressed(a.output / 'actions.npz', predictions=np.stack(actions),
                         captured=captured_action, replay_reference=reference)
     report = dict(mode=a.mode, record=str(a.record), task=info['usr_args'].get('task_name'),
@@ -130,6 +163,7 @@ def worker(a):
                                      p95=float(np.percentile(samples, 95))),
                   peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                   capture_match=capture_match, output_parity=parity, same_code=same_code,
+                  compiler_environment=compiler_state,
                   dynamo_counters={str(k): dict(v) for k, v in counters.items()},
                   source_hashes=source_hashes(),
                   timing_scope='warm-text-cache policy inference on captured real observation; '
@@ -229,11 +263,7 @@ def main():
         record = directory / rec['file']
         status['record'] = str(record)
         for mode in modes:
-            env = dict(os.environ)
-            env.pop('RW_PROBE_CAPTURE', None)
-            disabled = '0'
-            env.update(TORCH_COMPILE_DISABLE=disabled, TORCHDYNAMO_DISABLE=disabled,
-                       AGENTICWAM_FAST_JOINT='0', AGENTICWAM_TORCH_COMPILE='')
+            env = compile_environment(os.environ)
             cmd = [sys.executable, str(Path(__file__).resolve()), '--worker', '--mode', mode,
                    '--record', str(record), '--output', str(a.output / mode),
                    '--warmup', str(a.warmup), '--reps', str(a.reps),

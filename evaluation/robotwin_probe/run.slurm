@@ -18,6 +18,7 @@ cd "$repo"
 out="$repo/runs/robotwin_compile/${SLURM_JOB_ID}"
 export OMP_NUM_THREADS=4 AGENTICWAM_DEPLOY_DTYPE=bf16
 export AGENTICWAM_FAST_JOINT=0 AGENTICWAM_TORCH_COMPILE=
+# Capture uses the original eager policy; runner removes these for the compile worker.
 export TORCH_COMPILE_DISABLE=1 TORCHDYNAMO_DISABLE=1
 export HF_HOME=/public/home/terrypei/fcr_ws/AW-0/hf-cache
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1

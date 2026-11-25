@@ -1,11 +1,27 @@
 import types
 import unittest
 
-from runner import compile_check
+from runner import compile_check, compile_environment
 from stages import DISJOINT, ROUND, StageTimer, summarize
 
 
 class CoarseTests(unittest.TestCase):
+    def test_compile_worker_removes_disable_flags_instead_of_setting_zero(self):
+        for flag in ('0', '1'):
+            parent = dict(TORCH_COMPILE_DISABLE=flag, TORCHDYNAMO_DISABLE=flag,
+                          TORCHDYNAMO_SUPPRESS_ERRORS='0', RW_PROBE_CAPTURE='/capture',
+                          AGENTICWAM_FAST_JOINT='1', AGENTICWAM_TORCH_COMPILE='default',
+                          HF_HUB_OFFLINE='1', PATH='/existing')
+            child = compile_environment(parent)
+            for key in ('TORCH_COMPILE_DISABLE', 'TORCHDYNAMO_DISABLE',
+                        'TORCHDYNAMO_SUPPRESS_ERRORS', 'RW_PROBE_CAPTURE'):
+                self.assertNotIn(key, child)
+            self.assertEqual(parent['TORCH_COMPILE_DISABLE'], flag)
+            self.assertEqual(child['HF_HUB_OFFLINE'], '1')
+            self.assertEqual(child['PATH'], '/existing')
+            self.assertEqual(child['AGENTICWAM_FAST_JOINT'], '0')
+            self.assertEqual(child['AGENTICWAM_TORCH_COMPILE'], '')
+
     def test_percentile_uses_round_totals_and_residual_does_not_double_count(self):
         rounds = [{DISJOINT[0]: 2, 'Denoising': 90, 'Other device timeline': 8,
                    ROUND: 100, 'ROUND wall': 101},

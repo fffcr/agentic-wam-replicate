@@ -101,9 +101,14 @@ PROBE_MAX_REPLANS=2, PROBE_TASK=click_alarmclock, PROBE_PROTOCOLS=clean.
 Keep the default task/protocol/precision/steps to compare workload with the prior run.
 Comparing to old job 581676 is historical context, not a fresh paired A/B experiment.
 
-CPU checks (no PyTorch/GPU required):
+## Job 582914: compilation was disabled by an environment string
 
-```bash
-python -m unittest discover -s evaluation/robotwin_probe -p 'test_*.py' -v
-bash -n evaluation/robotwin_probe/run.slurm
-```
+In PyTorch 2.7.1, Dynamo config reads TORCH_COMPILE_DISABLE directly from the
+environment. The nonempty string "0" is truthy and still disables graph capture.
+The compile worker now unsets both disable variables before importing PyTorch,
+checks Dynamo's actual config before loading the model, and checks for a graph
+immediately after its first call. compiler_environment.json and first_call.json
+retain those checks. No zero-graph samples are accepted as compiled performance.
+
+After syncing the fix, submit the normal Slurm command above. It runs a new
+RoboTwin capture episode before compiled inference and the coarse stage table.
