@@ -67,6 +67,7 @@ class DetailTimer:
         self.events = []
         self.counts = {}
         self.token_lengths = {}
+        self.input_shapes = {}
 
     def wrap(self, obj, attr, name):
         original = getattr(obj, attr)
@@ -77,6 +78,9 @@ class DetailTimer:
             self.counts[name] = index + 1
             if name.endswith('.pre_attn'):
                 self.token_lengths[name.split('.')[0]] = int(args[1].shape[1])
+            if name == 'action.pre_dit':
+                self.input_shapes[name] = {k: list(v.shape) for k, v in kwargs.items()
+                                          if hasattr(v, 'shape')}
             start = self.torch.cuda.Event(enable_timing=True)
             end = self.torch.cuda.Event(enable_timing=True)
             start.record()
@@ -111,6 +115,7 @@ def main():
     p.add_argument('--input-npz', help='Optional head_camera/left_camera/right_camera uint8 images + state')
     p.add_argument('--detail', action='store_true', help='Additional eager-only attribution pass')
     p.add_argument('--trace', action='store_true', help='Additional PyTorch CPU/CUDA trace; not used for latency')
+    p.add_argument('--multistream', action='store_true', help='Experimental parallel expert pre/post scheduling')
     p.add_argument('--output', required=True, help='New output directory (must not exist)')
     p.add_argument('--tag', default='baseline')
     p.add_argument('--compare', help='Other run directory; require matching workload and GPU')
@@ -137,6 +142,8 @@ def main():
                        config_name=a.config)
     if a.detail and (rt.fast_joint or rt.compile_mode):
         p.error('--detail requires fast_joint and AGENTICWAM_TORCH_COMPILE off; clean timing supports both')
+    if a.multistream and (a.detail or rt.fast_joint or rt.compile_mode):
+        p.error('--multistream requires --detail off and both compilation paths off')
     out = Path(a.output).resolve()
     out.mkdir(parents=True, exist_ok=False)
     rng = np.random.default_rng(a.seed)
@@ -165,6 +172,22 @@ def main():
         torch.manual_seed(a.seed)
         torch.cuda.manual_seed_all(a.seed)
         torch.cuda.synchronize()
+
+    stream_check = None
+    if a.multistream:
+        from expert_streams import install
+        prepare()
+        reference, reference_code, _ = rt.infer(imgs, state, a.instruction)
+        torch.cuda.synchronize()
+        install(rt.policy.model.mot)
+        prepare()
+        candidate, candidate_code, _ = rt.infer(imgs, state, a.instruction)
+        torch.cuda.synchronize()
+        stream_check = compare_actions(np.asarray(reference), np.asarray(candidate), a.atol, a.rtol)
+        stream_check['same_code'] = reference_code == candidate_code
+        if not stream_check.get('allclose') or not stream_check['same_code']:
+            (out / 'stream_equivalence_failure.json').write_text(json.dumps(stream_check, indent=2))
+            raise RuntimeError('Multi-stream equivalence check failed; no performance claim made')
 
     for _ in range(a.warmup):
         prepare()
@@ -210,6 +233,7 @@ def main():
                   host=platform.node(), gpu=torch.cuda.get_device_name(),
                   torch=torch.__version__, cuda=torch.version.cuda,
                   fast_joint=rt.fast_joint, compile_mode=rt.compile_mode,
+                  multistream=a.multistream, stream_equivalence=stream_check,
                   warmup=a.warmup, reps=a.reps, round_wall_ms=summary(walls),
                   round_samples_ms=walls, peak_allocated_bytes=peak,
                   input_kind='recorded observation' if a.input_npz else 'synthetic fixed images + zero state',
@@ -292,6 +316,7 @@ def main():
                   for g in ('video', 'code', 'action', 'shared')}
         report['detail'] = dict(stage_ms=totals, group_ms=groups,
                                 calls=timer.counts, token_lengths=timer.token_lengths,
+                                input_shapes=timer.input_shapes,
                                 instrumented_wall_ms=detail_wall,
                                 warning='Instrumented current-stream intervals include launch gaps; '
                                         'NOT clean A/B latency or summed kernel busy time. '
@@ -303,15 +328,42 @@ def main():
         print('Amdahl projections only:', report['detail']['amdahl_estimates'])
 
     if a.trace:
-        from torch.profiler import profile, ProfilerActivity
+        from torch.profiler import profile, ProfilerActivity, record_function
+        from expert_trace import TraceRanges
         prepare()
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                     record_shapes=True) as prof:
-            rt.infer(imgs, state, a.instruction)
-            torch.cuda.synchronize()
+        ranges = TraceRanges()
+        try:
+            # Do not mutate methods inside an already compiled graph for attribution.
+            if not (rt.fast_joint or rt.compile_mode):
+                ranges.install(rt.policy.model)
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                         record_shapes=True) as prof:
+                with record_function('BENCH_ROUND'):
+                    rt.infer(imgs, state, a.instruction)
+                    torch.cuda.synchronize()
+        finally:
+            ranges.restore()
         prof.export_chrome_trace(str(out / 'trace.json'))
         (out / 'operators.txt').write_text(
             prof.key_averages().table(sort_by='self_device_time_total', row_limit=40))
+        report['trace_expert_annotations'] = not (rt.fast_joint or rt.compile_mode)
+
+    try:
+        from torch._dynamo.utils import counters
+        report['dynamo_counters'] = {str(k): dict(v) for k, v in counters.items()}
+    except ImportError:
+        report['dynamo_counters'] = None
+    report['experts'] = {}
+    for name, expert in rt.policy.model.mot.experts.items():
+        dtypes = {}
+        for param in expert.parameters():
+            key = str(param.dtype)
+            dtypes[key] = dtypes.get(key, 0) + param.numel()
+        report['experts'][name] = dict(parameters=sum(dtypes.values()), parameters_by_dtype=dtypes,
+                                       layers=len(expert.blocks),
+                                       architecture={k: getattr(expert, k) for k in
+                                                     ('hidden_dim', 'ffn_dim', 'num_heads', 'attn_head_dim')
+                                                     if isinstance(getattr(expert, k, None), (int, float))})
 
     if a.compare:
         base_dir = Path(a.compare)

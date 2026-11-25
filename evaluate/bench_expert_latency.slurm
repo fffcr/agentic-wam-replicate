@@ -20,6 +20,8 @@ tag=${BENCH_TAG:-baseline}
 args=()
 # Set BENCH_DETAIL=0 for clean-only tests of compiled implementations.
 if [[ ${BENCH_DETAIL:-1} == 1 ]]; then args+=(--detail); fi
+if [[ ${BENCH_TRACE:-0} == 1 ]]; then args+=(--trace); fi
+if [[ ${BENCH_MULTISTREAM:-0} == 1 ]]; then args+=(--multistream); fi
 if [[ -n ${BENCH_COMPARE:-} ]]; then args+=(--compare "$BENCH_COMPARE"); fi
 if [[ -n ${BENCH_INPUT_NPZ:-} ]]; then args+=(--input-npz "$BENCH_INPUT_NPZ"); fi
 mkdir -p "$repo/runs/bench_expert_latency/tmp"
